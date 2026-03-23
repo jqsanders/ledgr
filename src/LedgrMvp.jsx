@@ -98,6 +98,14 @@ function urlBase64ToUint8Array(base64String) {
   return out;
 }
 
+function formatTimeInput(timeStr) {
+  if (!timeStr) return "";
+  const [h, m] = timeStr.split(":").map(Number);
+  const ampm = h >= 12 ? "PM" : "AM";
+  const hour12 = h % 12 || 12;
+  return `${hour12}:${String(m).padStart(2, "0")} ${ampm}`;
+}
+
 const B = {
   bg: "#121212",
   surface: "#1e1e1e",
@@ -151,6 +159,7 @@ export default function LedgrMvp() {
   const [prepClientName, setPrepClientName] = useState("");
   const [prepServiceType, setPrepServiceType] = useState("");
   const [prepTime, setPrepTime] = useState("");
+  const [prepDate, setPrepDate] = useState(() => new Date().toISOString().split("T")[0]);
 
   const [taxRate, setTaxRate] = useState("25");
   const [rentAmount, setRentAmount] = useState("250");
@@ -367,6 +376,17 @@ export default function LedgrMvp() {
     });
 
     setSettings(settingsData);
+
+    // Reload today's cuts so dashboard is fresh after first-time setup
+    const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date(todayStart); todayEnd.setDate(todayEnd.getDate() + 1);
+    const { data: freshCuts } = await supabase
+      .from("cuts").select("*").eq("user_id", userId)
+      .gte("start_time", todayStart.toISOString()).lt("start_time", todayEnd.toISOString())
+      .not("end_time", "is", null).not("pay", "is", null)
+      .order("start_time", { ascending: true });
+    if (freshCuts) setLogs(freshCuts.map(parseCut));
+
     setView("dashboard");
   };
 
@@ -383,10 +403,12 @@ export default function LedgrMvp() {
   const addAppointment = async () => {
     if (!prepClientName || !prepServiceType) { alert("Please enter client name and service type"); return; }
 
+    const dateKey = prepDate || new Date().toISOString().split("T")[0];
+    const today = new Date().toISOString().split("T")[0];
+
     let supabaseId = null;
     if (prepTime) {
-      const today = new Date().toISOString().split("T")[0];
-      const scheduledAt = new Date(`${today}T${prepTime}:00`).toISOString();
+      const scheduledAt = new Date(`${dateKey}T${prepTime}:00`).toISOString();
       const { data } = await supabase.from("appointments").insert({
         user_id: userId,
         client_name: prepClientName,
@@ -397,13 +419,17 @@ export default function LedgrMvp() {
     }
 
     const newAppt = { id: Date.now().toString(), supabaseId, clientName: prepClientName, serviceType: prepServiceType, scheduledTime: prepTime, completed: false };
-    const updated = appointments.concat(newAppt).sort((a, b) => {
+    const existing = safeJsonParse(storage.get("ledgr_appointments_" + dateKey)?.value, []);
+    const updated = existing.concat(newAppt).sort((a, b) => {
       if (!a.scheduledTime) return 1;
       if (!b.scheduledTime) return -1;
       return a.scheduledTime.localeCompare(b.scheduledTime);
     });
-    setAppointments(updated);
-    storage.set("ledgr_appointments_" + new Date().toISOString().split("T")[0], JSON.stringify(updated));
+    storage.set("ledgr_appointments_" + dateKey, JSON.stringify(updated));
+
+    // Only update live state if scheduling for today
+    if (dateKey === today) setAppointments(updated);
+
     setPrepClientName(""); setPrepServiceType(""); setPrepTime("");
   };
 
@@ -577,7 +603,7 @@ export default function LedgrMvp() {
     const totalRevenue = logs.reduce((s, l) => s + (l.payout_amount || 0), 0);
     const totalServiceTime = logs.reduce((s, l) => s + (l.duration_minutes || 0), 0) / 60;
     const moneyPerHour = totalServiceTime > 0 ? totalRevenue / totalServiceTime : 0;
-    const totalTaxSetAside = logs.reduce((s, l) => s + (l.tax_set_aside || 0), 0);
+    const totalTaxSetAside = logs.reduce((s, l) => s + (l.payout_amount * (settings.taxRate / 100)), 0);
     const dailyRent = settings.rentFrequency === "Weekly"
       ? settings.rentAmount / settings.workingDays
       : settings.rentAmount / (settings.workingDays * 4.33);
@@ -888,7 +914,7 @@ export default function LedgrMvp() {
           <div className="flex justify-between items-start mb-4">
             <div>
               <h1 className="text-2xl font-bold uppercase tracking-widest" style={{ color: B.gold }}>LEDGR</h1>
-              <p className="text-xs" style={{ color: B.muted }}>by The Fade Collective</p>
+              <p className="text-xs" style={{ color: B.muted }}>{profileDisplayName || "by The Fade Collective"}</p>
             </div>
             <div className="flex gap-3">
               <button onClick={() => setView("history")} style={{ color: B.muted }} className="hover:opacity-80">
@@ -976,7 +1002,7 @@ export default function LedgrMvp() {
                   style={{ backgroundColor: B.surface, border: `1px solid ${B.gold}` }}>
                   <div className="flex justify-between items-start mb-1">
                     <div className="flex-1">
-                      {apt.scheduledTime && <p className="text-xs font-mono mb-1" style={{ color: B.gold }}>{apt.scheduledTime}</p>}
+                      {apt.scheduledTime && <p className="text-xs font-mono mb-1" style={{ color: B.gold }}>{formatTimeInput(apt.scheduledTime)}</p>}
                       <p className="font-semibold" style={{ color: B.text }}>{apt.clientName}</p>
                       <p className="text-sm" style={{ color: B.muted }}>{apt.serviceType}</p>
                     </div>
@@ -1049,6 +1075,15 @@ export default function LedgrMvp() {
             <div className="p-6 space-y-5">
               <h2 className="text-xl font-bold" style={{ color: B.gold }}>Prep Your Day</h2>
 
+              <div>
+                <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>Date</label>
+                <input type="date" value={prepDate} onChange={(e) => setPrepDate(e.target.value)}
+                  className="w-full rounded-lg px-4 py-3 focus:outline-none text-sm"
+                  style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text, colorScheme: "dark" }}
+                  onFocus={(e) => (e.target.style.borderColor = B.gold)}
+                  onBlur={(e) => (e.target.style.borderColor = B.border)} />
+              </div>
+
               {[
                 { label: "Client Name", value: prepClientName, set: setPrepClientName, type: "text", placeholder: "Enter client name" },
               ].map(({ label, value, set, type, placeholder }) => (
@@ -1090,7 +1125,9 @@ export default function LedgrMvp() {
 
               {appointments.length > 0 && (
                 <div style={{ borderTop: `1px solid ${B.border}`, paddingTop: "1rem" }}>
-                  <h3 className="text-sm font-semibold mb-3" style={{ color: B.muted }}>Today's Schedule</h3>
+                  <h3 className="text-sm font-semibold mb-3" style={{ color: B.muted }}>
+                    {prepDate === new Date().toISOString().split("T")[0] ? "Today's Schedule" : `Schedule for ${new Date(prepDate + "T12:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric" })}`}
+                  </h3>
                   <div className="space-y-2 max-h-48 overflow-y-auto">
                     {appointments.map((apt) => (
                       <div key={apt.id} className="flex justify-between items-center rounded-lg p-3"
@@ -1098,7 +1135,7 @@ export default function LedgrMvp() {
                         <div>
                           <p className="text-sm font-medium" style={{ color: B.text }}>{apt.clientName}</p>
                           <p className="text-xs" style={{ color: B.muted }}>
-                            {apt.serviceType}{apt.scheduledTime && " · " + apt.scheduledTime}
+                            {apt.serviceType}{apt.scheduledTime && " · " + formatTimeInput(apt.scheduledTime)}
                           </p>
                         </div>
                         {apt.completed
