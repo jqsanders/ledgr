@@ -7,11 +7,15 @@ export function AuthProvider({ children }) {
   const [session, setSession] = useState(undefined);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
+    // Set up listener before getSession() so the SIGNED_IN event fired
+    // by an email confirmation token in the URL is never missed.
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
     });
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    // getSession() detects any token/code in the URL (email confirmation
+    // redirects) and exchanges it for a live session automatically.
+    supabase.auth.getSession().then(({ data: { session } }) => {
       setSession(session);
     });
 
