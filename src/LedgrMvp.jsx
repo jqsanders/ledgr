@@ -69,6 +69,13 @@ function formatAMPM(isoString) {
   });
 }
 
+function buildTimestamp(dateStr, hour, minute, ampm) {
+  let h = parseInt(hour, 10);
+  if (ampm === "PM" && h !== 12) h += 12;
+  if (ampm === "AM" && h === 12) h = 0;
+  return new Date(`${dateStr}T${String(h).padStart(2, "0")}:${minute}:00`).toISOString();
+}
+
 const B = {
   bg: "#121212",
   surface: "#1e1e1e",
@@ -104,6 +111,19 @@ export default function LedgrMvp() {
   const [payoutAmount, setPayoutAmount] = useState("");
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [currentCutId, setCurrentCutId] = useState(null);
+
+  const [showPastCutModal, setShowPastCutModal] = useState(false);
+  const [pastCutDate, setPastCutDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [pastCutStartHour, setPastCutStartHour] = useState("9");
+  const [pastCutStartMin, setPastCutStartMin] = useState("00");
+  const [pastCutStartAmpm, setPastCutStartAmpm] = useState("AM");
+  const [pastCutEndHour, setPastCutEndHour] = useState("10");
+  const [pastCutEndMin, setPastCutEndMin] = useState("00");
+  const [pastCutEndAmpm, setPastCutEndAmpm] = useState("AM");
+  const [pastCutServiceType, setPastCutServiceType] = useState("");
+  const [pastCutClientName, setPastCutClientName] = useState("");
+  const [pastCutPay, setPastCutPay] = useState("");
+  const [pastCutSaving, setPastCutSaving] = useState(false);
 
   const [showPrepModal, setShowPrepModal] = useState(false);
   const [prepClientName, setPrepClientName] = useState("");
@@ -416,6 +436,56 @@ export default function LedgrMvp() {
     setPayoutAmount("");
     setElapsedSeconds(0);
     setCurrentCutId(null);
+  };
+
+  const resetPastCutModal = () => {
+    setShowPastCutModal(false);
+    setPastCutDate(new Date().toISOString().split("T")[0]);
+    setPastCutStartHour("9"); setPastCutStartMin("00"); setPastCutStartAmpm("AM");
+    setPastCutEndHour("10"); setPastCutEndMin("00"); setPastCutEndAmpm("AM");
+    setPastCutServiceType(""); setPastCutClientName(""); setPastCutPay("");
+  };
+
+  const savePastCut = async () => {
+    if (!pastCutServiceType || !pastCutPay) {
+      alert("Please enter service type and pay amount");
+      return;
+    }
+    const startISO = buildTimestamp(pastCutDate, pastCutStartHour, pastCutStartMin, pastCutStartAmpm);
+    const endISO = buildTimestamp(pastCutDate, pastCutEndHour, pastCutEndMin, pastCutEndAmpm);
+    if (new Date(endISO) <= new Date(startISO)) {
+      alert("End time must be after start time");
+      return;
+    }
+    const taxSetAside = parseFloat(pastCutPay) * ((settings?.taxRate ?? 25) / 100);
+    const notes = JSON.stringify({ client_name: pastCutClientName, service_type: pastCutServiceType, tax_set_aside: taxSetAside });
+
+    setPastCutSaving(true);
+    const { error } = await supabase.from("cuts").insert({
+      user_id: userId,
+      start_time: startISO,
+      end_time: endISO,
+      pay: parseFloat(pastCutPay),
+      notes,
+    });
+    setPastCutSaving(false);
+
+    if (error) { alert("Failed to save: " + error.message); return; }
+
+    resetPastCutModal();
+
+    // Refresh dashboard if the logged cut is from today
+    const todayStr = new Date().toISOString().split("T")[0];
+    if (pastCutDate === todayStr) {
+      const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+      const todayEnd = new Date(todayStart); todayEnd.setDate(todayEnd.getDate() + 1);
+      const { data: cuts } = await supabase
+        .from("cuts").select("*").eq("user_id", userId)
+        .gte("start_time", todayStart.toISOString()).lt("start_time", todayEnd.toISOString())
+        .not("end_time", "is", null).not("pay", "is", null)
+        .order("start_time", { ascending: true });
+      if (cuts) setLogs(cuts.map(parseCut));
+    }
   };
 
   const calculateMetrics = () => {
@@ -814,11 +884,18 @@ export default function LedgrMvp() {
             style={{ backgroundColor: "transparent", border: `1px solid ${B.gold}`, color: B.gold }}>
             <ClipboardList size={20} /> Prep Day
           </button>
-          <button onClick={() => setShowLogModal(true)}
-            className="w-full font-bold py-4 rounded-lg flex items-center justify-center gap-2"
-            style={{ backgroundColor: B.gold, color: B.bg }}>
-            <Plus size={24} /> Add Walk-in
-          </button>
+          <div className="grid grid-cols-2 gap-3">
+            <button onClick={() => setShowLogModal(true)}
+              className="font-bold py-4 rounded-lg flex items-center justify-center gap-2"
+              style={{ backgroundColor: B.gold, color: B.bg }}>
+              <Plus size={20} /> Add Walk-in
+            </button>
+            <button onClick={() => setShowPastCutModal(true)}
+              className="font-bold py-4 rounded-lg flex items-center justify-center gap-2"
+              style={{ backgroundColor: B.gold, color: B.bg }}>
+              <Clock size={20} /> Log Past Cut
+            </button>
+          </div>
         </div>
       </div>
 
@@ -975,6 +1052,137 @@ export default function LedgrMvp() {
                     Log Transaction
                   </button>
                 )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Log past cut modal */}
+      {showPastCutModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ backgroundColor: "rgba(0,0,0,0.92)" }}>
+          <div className="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-lg" style={{ backgroundColor: B.surface, border: `1px solid ${B.border}` }}>
+            <div className="p-6 space-y-5">
+              <h2 className="text-xl font-bold" style={{ color: B.gold }}>Log Past Cut</h2>
+
+              {/* Date */}
+              <div>
+                <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>Date</label>
+                <input type="date" value={pastCutDate} onChange={(e) => setPastCutDate(e.target.value)}
+                  className="w-full rounded-lg px-4 py-3 focus:outline-none text-sm"
+                  style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text, colorScheme: "dark" }}
+                  onFocus={(e) => (e.target.style.borderColor = B.gold)}
+                  onBlur={(e) => (e.target.style.borderColor = B.border)} />
+              </div>
+
+              {/* Start time */}
+              <div>
+                <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>Start Time</label>
+                <div className="flex gap-2 items-center">
+                  <select value={pastCutStartHour} onChange={(e) => setPastCutStartHour(e.target.value)}
+                    className="flex-1 rounded-lg px-3 py-3 focus:outline-none text-sm"
+                    style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}>
+                    {Array.from({ length: 12 }, (_, i) => i + 1).map((h) => (
+                      <option key={h} value={String(h)}>{h}</option>
+                    ))}
+                  </select>
+                  <span style={{ color: B.muted }}>:</span>
+                  <select value={pastCutStartMin} onChange={(e) => setPastCutStartMin(e.target.value)}
+                    className="flex-1 rounded-lg px-3 py-3 focus:outline-none text-sm"
+                    style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}>
+                    {["00","05","10","15","20","25","30","35","40","45","50","55"].map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                  <div className="flex rounded-lg overflow-hidden" style={{ border: `1px solid ${B.border}` }}>
+                    {["AM", "PM"].map((a) => (
+                      <button key={a} onClick={() => setPastCutStartAmpm(a)}
+                        className="px-3 py-3 text-sm font-semibold"
+                        style={{ backgroundColor: pastCutStartAmpm === a ? B.gold : B.bg, color: pastCutStartAmpm === a ? B.bg : B.muted }}>
+                        {a}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* End time */}
+              <div>
+                <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>End Time</label>
+                <div className="flex gap-2 items-center">
+                  <select value={pastCutEndHour} onChange={(e) => setPastCutEndHour(e.target.value)}
+                    className="flex-1 rounded-lg px-3 py-3 focus:outline-none text-sm"
+                    style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}>
+                    {Array.from({ length: 12 }, (_, i) => i + 1).map((h) => (
+                      <option key={h} value={String(h)}>{h}</option>
+                    ))}
+                  </select>
+                  <span style={{ color: B.muted }}>:</span>
+                  <select value={pastCutEndMin} onChange={(e) => setPastCutEndMin(e.target.value)}
+                    className="flex-1 rounded-lg px-3 py-3 focus:outline-none text-sm"
+                    style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}>
+                    {["00","05","10","15","20","25","30","35","40","45","50","55"].map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                  <div className="flex rounded-lg overflow-hidden" style={{ border: `1px solid ${B.border}` }}>
+                    {["AM", "PM"].map((a) => (
+                      <button key={a} onClick={() => setPastCutEndAmpm(a)}
+                        className="px-3 py-3 text-sm font-semibold"
+                        style={{ backgroundColor: pastCutEndAmpm === a ? B.gold : B.bg, color: pastCutEndAmpm === a ? B.bg : B.muted }}>
+                        {a}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Service type */}
+              <div>
+                <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>Service Type</label>
+                <select value={pastCutServiceType} onChange={(e) => setPastCutServiceType(e.target.value)}
+                  className="w-full rounded-lg px-4 py-3 focus:outline-none text-sm"
+                  style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}>
+                  <option value="">Select service</option>
+                  {serviceTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+                </select>
+              </div>
+
+              {/* Client name */}
+              <div>
+                <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>
+                  Client Name <span style={{ color: B.muted }}>(optional)</span>
+                </label>
+                <input type="text" value={pastCutClientName} onChange={(e) => setPastCutClientName(e.target.value)}
+                  className="w-full rounded-lg px-4 py-3 focus:outline-none text-sm"
+                  style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}
+                  onFocus={(e) => (e.target.style.borderColor = B.gold)}
+                  onBlur={(e) => (e.target.style.borderColor = B.border)}
+                  placeholder="Enter client name" />
+              </div>
+
+              {/* Pay amount */}
+              <div>
+                <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>Pay Amount</label>
+                <div className="relative">
+                  <span className="absolute left-4 top-1/2 -translate-y-1/2 font-semibold" style={{ color: B.muted }}>$</span>
+                  <input type="number" step="0.01" value={pastCutPay} onChange={(e) => setPastCutPay(e.target.value)}
+                    className="w-full rounded-lg pl-8 pr-4 py-3 focus:outline-none text-sm"
+                    style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}
+                    onFocus={(e) => (e.target.style.borderColor = B.gold)}
+                    onBlur={(e) => (e.target.style.borderColor = B.border)}
+                    placeholder="0.00" />
+                </div>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button onClick={resetPastCutModal} className="flex-1 font-semibold py-3 rounded-lg"
+                  style={{ backgroundColor: "transparent", border: `1px solid ${B.border}`, color: B.text }}>
+                  Cancel
+                </button>
+                <button onClick={savePastCut} disabled={pastCutSaving} className="flex-1 font-semibold py-3 rounded-lg hover:opacity-90"
+                  style={{ backgroundColor: B.gold, color: B.bg, opacity: pastCutSaving ? 0.5 : 1 }}>
+                  {pastCutSaving ? "Saving…" : "Save Cut"}
+                </button>
               </div>
             </div>
           </div>
