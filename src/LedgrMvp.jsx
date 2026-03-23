@@ -76,6 +76,28 @@ function buildTimestamp(dateStr, hour, minute, ampm) {
   return new Date(`${dateStr}T${String(h).padStart(2, "0")}:${minute}:00`).toISOString();
 }
 
+function to24h(hour, min, ampm) {
+  let h = parseInt(hour, 10);
+  if (ampm === "PM" && h !== 12) h += 12;
+  if (ampm === "AM" && h === 12) h = 0;
+  return `${String(h).padStart(2, "0")}:${min}`;
+}
+
+function to12h(timeStr) {
+  if (!timeStr) return { hour: "8", min: "00", ampm: "PM" };
+  const [h, m] = timeStr.split(":").map(Number);
+  return { hour: String(h % 12 || 12), min: String(m).padStart(2, "0"), ampm: h >= 12 ? "PM" : "AM" };
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = window.atob(base64);
+  const out = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) out[i] = rawData.charCodeAt(i);
+  return out;
+}
+
 const B = {
   bg: "#121212",
   surface: "#1e1e1e",
@@ -136,9 +158,14 @@ export default function LedgrMvp() {
   const [workingDays, setWorkingDays] = useState("5");
 
   const [profileDisplayName, setProfileDisplayName] = useState("");
-  const [profilePhone, setProfilePhone] = useState("");
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileMsg, setProfileMsg] = useState(null);
+
+  const [notificationsEnabled, setNotificationsEnabled] = useState(true);
+  const [eodReminderHour, setEodReminderHour] = useState("8");
+  const [eodReminderMin, setEodReminderMin] = useState("00");
+  const [eodReminderAmpm, setEodReminderAmpm] = useState("PM");
+  const [showNotifPrompt, setShowNotifPrompt] = useState(false);
 
   const serviceTypes = [
     "Haircut", "Color", "Highlights", "Manicure", "Pedicure",
@@ -214,9 +241,20 @@ export default function LedgrMvp() {
 
       if (profileData) {
         setProfileDisplayName(profileData.display_name || "");
-        setProfilePhone(profileData.phone || "");
+        const notifOn = profileData.notifications_enabled ?? true;
+        setNotificationsEnabled(notifOn);
+        const t = to12h(profileData.eod_reminder_time || "20:00");
+        setEodReminderHour(t.hour);
+        setEodReminderMin(t.min);
+        setEodReminderAmpm(t.ampm);
+        if (notifOn && "Notification" in window && Notification.permission === "default") {
+          setShowNotifPrompt(true);
+        }
       } else {
         await supabase.from("profiles").insert({ id: userId });
+        if ("Notification" in window && Notification.permission === "default") {
+          setShowNotifPrompt(true);
+        }
       }
     } finally {
       setIsLoading(false);
@@ -321,6 +359,13 @@ export default function LedgrMvp() {
     };
     const ok = storage.set("ledgr_settings", JSON.stringify(settingsData));
     if (!ok) { alert("Error saving settings"); return; }
+
+    await supabase.from("profiles").upsert({
+      id: userId,
+      notifications_enabled: notificationsEnabled,
+      eod_reminder_time: to24h(eodReminderHour, eodReminderMin, eodReminderAmpm),
+    });
+
     setSettings(settingsData);
     setView("dashboard");
   };
@@ -330,14 +375,28 @@ export default function LedgrMvp() {
     setProfileMsg(null);
     const { error } = await supabase
       .from("profiles")
-      .upsert({ id: userId, display_name: profileDisplayName, phone: profilePhone });
+      .upsert({ id: userId, display_name: profileDisplayName });
     setProfileSaving(false);
     setProfileMsg(error ? { type: "error", text: error.message } : { type: "success", text: "Profile saved." });
   };
 
   const addAppointment = async () => {
     if (!prepClientName || !prepServiceType) { alert("Please enter client name and service type"); return; }
-    const newAppt = { id: Date.now().toString(), clientName: prepClientName, serviceType: prepServiceType, scheduledTime: prepTime, completed: false };
+
+    let supabaseId = null;
+    if (prepTime) {
+      const today = new Date().toISOString().split("T")[0];
+      const scheduledAt = new Date(`${today}T${prepTime}:00`).toISOString();
+      const { data } = await supabase.from("appointments").insert({
+        user_id: userId,
+        client_name: prepClientName,
+        service_type: prepServiceType,
+        scheduled_at: scheduledAt,
+      }).select().single();
+      supabaseId = data?.id ?? null;
+    }
+
+    const newAppt = { id: Date.now().toString(), supabaseId, clientName: prepClientName, serviceType: prepServiceType, scheduledTime: prepTime, completed: false };
     const updated = appointments.concat(newAppt).sort((a, b) => {
       if (!a.scheduledTime) return 1;
       if (!b.scheduledTime) return -1;
@@ -349,9 +408,13 @@ export default function LedgrMvp() {
   };
 
   const removeAppointment = async (id) => {
+    const apt = appointments.find((a) => a.id === id);
     const updated = appointments.filter((a) => a.id !== id);
     setAppointments(updated);
     storage.set("ledgr_appointments_" + new Date().toISOString().split("T")[0], JSON.stringify(updated));
+    if (apt?.supabaseId) {
+      await supabase.from("appointments").delete().eq("id", apt.supabaseId);
+    }
   };
 
   const openLogModalForAppointment = (apt) => {
@@ -412,6 +475,9 @@ export default function LedgrMvp() {
       const updated = appointments.map((a) => a.id === selectedAppointment.id ? { ...a, completed: true } : a);
       setAppointments(updated);
       storage.set("ledgr_appointments_" + today, JSON.stringify(updated));
+      if (selectedAppointment.supabaseId) {
+        await supabase.from("appointments").update({ completed: true }).eq("id", selectedAppointment.supabaseId);
+      }
     }
 
     // Reload today's cuts
@@ -444,6 +510,24 @@ export default function LedgrMvp() {
     setPastCutStartHour("9"); setPastCutStartMin("00"); setPastCutStartAmpm("AM");
     setPastCutEndHour("10"); setPastCutEndMin("00"); setPastCutEndAmpm("AM");
     setPastCutServiceType(""); setPastCutClientName(""); setPastCutPay("");
+  };
+
+  const requestPushPermission = async () => {
+    setShowNotifPrompt(false);
+    if (!("Notification" in window) || !("serviceWorker" in navigator)) return;
+    const permission = await Notification.requestPermission();
+    if (permission !== "granted") return;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(import.meta.env.VITE_VAPID_PUBLIC_KEY),
+      });
+      await supabase.from("push_subscriptions").delete().eq("user_id", userId);
+      await supabase.from("push_subscriptions").insert({ user_id: userId, subscription: sub.toJSON() });
+    } catch (err) {
+      console.error("Push subscription failed:", err);
+    }
   };
 
   const savePastCut = async () => {
@@ -574,6 +658,53 @@ export default function LedgrMvp() {
                 placeholder="5" />
             </div>
 
+            {/* Notifications section */}
+            <div style={{ borderTop: `1px solid ${B.border}`, paddingTop: "1.5rem" }}>
+              <h3 className="text-base font-semibold mb-4" style={{ color: B.gold }}>Notifications</h3>
+
+              <div className="flex items-center justify-between mb-4">
+                <span className="text-sm" style={{ color: B.text }}>Enable reminders</span>
+                <button onClick={() => setNotificationsEnabled(!notificationsEnabled)}
+                  className="w-12 h-6 rounded-full transition-colors relative"
+                  style={{ backgroundColor: notificationsEnabled ? B.gold : B.border }}>
+                  <span className="absolute top-1 w-4 h-4 rounded-full transition-all"
+                    style={{ backgroundColor: B.bg, left: notificationsEnabled ? "calc(100% - 1.25rem)" : "0.25rem" }} />
+                </button>
+              </div>
+
+              {notificationsEnabled && (
+                <div>
+                  <label className="block text-sm font-medium mb-2" style={{ color: B.text }}>End of day reminder</label>
+                  <div className="flex gap-2 items-center">
+                    <select value={eodReminderHour} onChange={(e) => setEodReminderHour(e.target.value)}
+                      className="flex-1 rounded-lg px-3 py-2 focus:outline-none text-sm"
+                      style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}>
+                      {Array.from({ length: 12 }, (_, i) => i + 1).map((h) => (
+                        <option key={h} value={String(h)}>{h}</option>
+                      ))}
+                    </select>
+                    <span style={{ color: B.muted }}>:</span>
+                    <select value={eodReminderMin} onChange={(e) => setEodReminderMin(e.target.value)}
+                      className="flex-1 rounded-lg px-3 py-2 focus:outline-none text-sm"
+                      style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}>
+                      {["00","05","10","15","20","25","30","35","40","45","50","55"].map((m) => (
+                        <option key={m} value={m}>{m}</option>
+                      ))}
+                    </select>
+                    <div className="flex rounded-lg overflow-hidden" style={{ border: `1px solid ${B.border}` }}>
+                      {["AM", "PM"].map((a) => (
+                        <button key={a} onClick={() => setEodReminderAmpm(a)}
+                          className="px-3 py-2 text-sm font-semibold"
+                          style={{ backgroundColor: eodReminderAmpm === a ? B.gold : B.bg, color: eodReminderAmpm === a ? B.bg : B.muted }}>
+                          {a}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <button onClick={saveSettings}
               className="w-full font-semibold py-3 rounded-lg transition-opacity hover:opacity-90"
               style={{ backgroundColor: B.gold, color: B.bg }}>
@@ -624,16 +755,6 @@ export default function LedgrMvp() {
                 onFocus={(e) => (e.target.style.borderColor = B.gold)}
                 onBlur={(e) => (e.target.style.borderColor = B.border)}
                 placeholder="Your name" />
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium mb-1" style={{ color: B.text }}>Phone Number</label>
-              <input type="tel" value={profilePhone} onChange={(e) => setProfilePhone(e.target.value)}
-                className="w-full rounded-lg px-3 py-2 text-sm focus:outline-none"
-                style={{ backgroundColor: B.bg, border: `1px solid ${B.border}`, color: B.text }}
-                onFocus={(e) => (e.target.style.borderColor = B.gold)}
-                onBlur={(e) => (e.target.style.borderColor = B.border)}
-                placeholder="(555) 000-0000" />
             </div>
 
             <button onClick={saveProfile} disabled={profileSaving}
@@ -807,6 +928,28 @@ export default function LedgrMvp() {
       </div>
 
       <div className="max-w-md mx-auto px-6 mt-4">
+        {/* Notification permission prompt */}
+        {showNotifPrompt && (
+          <div className="rounded-lg p-4 mb-4 flex gap-3 items-start" style={{ backgroundColor: B.surface, border: `1px solid ${B.gold}` }}>
+            <div className="flex-1">
+              <p className="font-semibold text-sm mb-1" style={{ color: B.text }}>Enable appointment reminders</p>
+              <p className="text-xs" style={{ color: B.muted }}>Get notified before appointments and at end of day.</p>
+            </div>
+            <div className="flex flex-col gap-2 shrink-0">
+              <button onClick={requestPushPermission}
+                className="text-xs font-semibold px-3 py-1.5 rounded-lg"
+                style={{ backgroundColor: B.gold, color: B.bg }}>
+                Enable
+              </button>
+              <button onClick={() => setShowNotifPrompt(false)}
+                className="text-xs px-3 py-1.5 rounded-lg"
+                style={{ color: B.muted, border: `1px solid ${B.border}` }}>
+                Later
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Metrics breakdown */}
         <div className="rounded-lg p-4 mb-6 space-y-3" style={{ backgroundColor: B.surface, border: `1px solid ${B.border}` }}>
           {[
